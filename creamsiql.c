@@ -1,7 +1,7 @@
 /*
  * CReaMSiQL — a minimal append-only SQL engine in one C file
  *
- * Supports:
+ * Now a small TCP server instead of a stdin/stdout REPL. Same grammar:
  *   CREATE TABLE t (id INDEX, name, email INDEX)
  *   INSERT INTO t VALUES ('1', 'Alice', 'alice@example.com')
  *   SELECT * FROM t [WHERE col = val [AND col = val ...]]
@@ -12,11 +12,39 @@
  *   TABLENAME.data       — pipe-delimited rows, newline-terminated, append-only
  *   TABLENAME.COL.idx    — fixed-size open-addressing hash table
  *
+ * Threading model:
+ *   - N worker threads block in accept() on one shared listening socket.
+ *     The kernel wakes exactly one waiter per incoming connection — no
+ *     application-level dispatch queue needed for connection fan-out.
+ *   - A worker owns a connection start-to-finish: read a line, act on it,
+ *     write the reply, repeat until the client closes. SELECT is executed
+ *     directly on the worker — every query already opens its own fd and
+ *     uses pread, so concurrent reads need no locking at all.
+ *   - CREATE and INSERT are forwarded to one dedicated writer thread and
+ *     the worker blocks until it replies. That thread is the only caller
+ *     of write_schema/idx_create/append_row/idx_insert, so the existing
+ *     multi-step, non-atomic mutation code is correct under concurrency
+ *     without changing a single line of it — there is never more than one
+ *     writer to race against. It also gives CREATE TABLE an ordering
+ *     guarantee for free: a CREATE is fully finished (schema file *and*
+ *     every index file) before the writer even looks at the next queued
+ *     job, so a client that creates a table and immediately inserts into
+ *     it can never observe it half-built.
+ *   - The lexer's token buffer is the same "one static array" as before,
+ *     just declared _Thread_local: each pool thread gets its own private
+ *     copy, allocated once when the thread is created — not malloc'd per
+ *     request. do_create/do_insert/do_select/do_select_scan/append_row
+ *     are completely unmodified; only the dispatch layer changed.
+ *
  * Design:
- *   - Zero deps beyond POSIX: open/read/write/pread/pwrite/lseek/ftruncate
- *   - Compile: cc creamsiql.c -o creamsiql
- *   - No malloc. One static token array; all I/O via fd + pread/pwrite.
- *   - No AST. Parse → act in one pass; memory touched in one place.
+ *   - Zero deps beyond POSIX: socket/accept/pthread + open/read/write/
+ *     pread/pwrite/lseek/ftruncate
+ *   - Compile: cc creamsiql.c -o creamsiql -pthread
+ *   - No malloc anywhere, including in the threading layer: the write
+ *     queue is a fixed-size static array; each blocked worker's
+ *     completion lock/cond live on its own call stack, not heap.
+ *   - No AST. Parse → act in one pass; memory touched in one place —
+ *     now read per-thread, and write in exactly one thread.
  *   - Append-only data: byte offsets in .data are stable forever.
  *   - WHERE: index used for first condition; remaining AND clauses filter
  *     the matched rows in a streaming pass. No index → full linear scan.
@@ -33,7 +61,8 @@
  *     [8..15]  data_off  u64  — byte offset of row in .data
  *    [16..23]  chain     u64  — next overflow bucket index (0 = end)
  *
- * Compile: cc creamsiql.c -o creamsiql
+ * Run: ./creamsiql [port] [workers]   (defaults: 7878, one per core)
+ * Talk to it with: nc 127.0.0.1 7878
  */
 
 #include <fcntl.h>
@@ -41,6 +70,12 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* ─── tuneable limits ───────────────────────────────────────────── */
 #define MAX_TOKENS      128
@@ -55,6 +90,9 @@
 #define IDX_TOTAL      (IDX_BUCKETS + IDX_OVERFLOW)
 #define IDX_HDR_SIZE     16
 #define IDX_BUCKET_SZ    24
+#define DEFAULT_PORT   7878
+#define MAX_WORKERS     256   /* hard cap on pool size                */
+#define WRITE_QUEUE_CAP  64   /* fixed-size, no malloc                */
 
 /* ─── token types ───────────────────────────────────────────────── */
 typedef enum {
@@ -69,12 +107,21 @@ typedef enum {
 typedef struct { TokType type; char value[VAL_LEN]; } Token;
 
 /* ─── globals ───────────────────────────────────────────────────── */
-static Token tokens[MAX_TOKENS];
-static int   ntok = 0;
-static int   pos  = 0;
+/* _Thread_local: each pool thread gets its own private copy of these,
+ * allocated once when the thread is created — same "no malloc, one
+ * static array" property as before, just sliced per worker so two
+ * threads parsing concurrently never clobber each other's tokens. */
+static _Thread_local Token tokens[MAX_TOKENS];
+static _Thread_local int   ntok = 0;
+static _Thread_local int   pos  = 0;
+
+/* which fd output goes to. Defaults to stdout (1) so the startup
+ * banner on the main thread works unchanged; each worker sets this to
+ * its client's socket fd for the lifetime of that connection. */
+static _Thread_local int out_fd = 1;
 
 /* ─── output helpers ────────────────────────────────────────────── */
-static void out(const char *s) { write(1, s, strlen(s)); }
+static void out(const char *s) { write(out_fd, s, strlen(s)); }
 static void oerr(const char *s) { out("error: "); out(s); out("\n"); }
 
 /* ─── integer to decimal string ─────────────────────────────────── */
@@ -413,8 +460,14 @@ static void append_row(const char *tname, ColDef *cols, int ncols,
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) { oerr("cannot open data file"); return; }
 
-    /* record offset before writing — stable forever (append-only) */
-    off_t row_off = lseek(fd, 0, SEEK_CUR);
+    /* record offset before writing — stable forever (append-only).
+     * NOTE: O_APPEND guarantees the upcoming write() lands at EOF, but
+     * it does not move the fd's own seek pointer there on open(), so
+     * SEEK_CUR here would just read back the fd's initial position (0).
+     * SEEK_END gives the real offset the row is about to be written at.
+     * Safe with exactly one writer (true for both the original REPL and
+     * the single dedicated writer thread below — never two appenders). */
+    off_t row_off = lseek(fd, 0, SEEK_END);
     for (int i = 0; i < nvals; i++) {
         fd_puts(fd, vals[i]);
         fd_puts(fd, i < nvals-1 ? "|" : "\n");
@@ -588,40 +641,187 @@ static void do_select(void) {
     do_select_scan(tname, cols, ncols, conds, nconds, count_only);
 }
 
-/* ─── REPL ──────────────────────────────────────────────────────── */
-static int read_line(char *buf, int sz) {
-    int i = 0; char c;
-    while (i < sz - 1) {
-        ssize_t n = read(0, &c, 1);
-        if (n <= 0) { buf[i]='\0'; return (i > 0) ? i : -1; }
-        if (c == '\n') break;
-        buf[i++] = c;
-    }
-    buf[i] = '\0';
-    return i;
+/* ─── single dedicated writer thread ───────────────────────────────
+ * Only this thread ever calls do_create/do_insert, so it's the only
+ * thread that ever calls write_schema/idx_create/append_row/idx_insert.
+ * That's what makes those functions' multi-step, non-atomic writes
+ * correct under concurrency without changing a line of them.
+ *
+ * Each job's completion lock/cond/flag live on the CALLING WORKER'S
+ * OWN STACK (set up in submit_write_job), not in the queue slot. The
+ * writer copies everything it needs out of the slot — the line (via
+ * lex, into its own thread-local tokens) and the three pointers — while
+ * still holding qlock, then immediately frees the slot. A new push can
+ * safely reuse that slot from that point on, because nothing will ever
+ * read it again for the old request; the writer finishes the slow part
+ * (do_create/do_insert) using only its local copies, and finally
+ * signals completion through the pointers it saved, not the slot. */
+typedef struct {
+    char line[LINE_LEN];
+    int  client_fd;
+    pthread_mutex_t *done_lock;
+    pthread_cond_t  *done_cond;
+    int             *done_flag;
+} WriteJob;
+
+static WriteJob wq[WRITE_QUEUE_CAP];
+static int qhead = 0, qtail = 0, qcount = 0;
+static pthread_mutex_t qlock      = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  q_has_work = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  q_has_room = PTHREAD_COND_INITIALIZER;
+static volatile sig_atomic_t running = 1;
+
+/* called by a worker thread for CREATE/INSERT; blocks until the writer
+ * has fully handled it and replied to client_fd directly */
+static void submit_write_job(const char *line, int client_fd) {
+    pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;
+    int done = 0;
+
+    pthread_mutex_lock(&qlock);
+    while (qcount == WRITE_QUEUE_CAP) pthread_cond_wait(&q_has_room, &qlock);
+    WriteJob *j = &wq[qtail];
+    qtail = (qtail + 1) % WRITE_QUEUE_CAP;
+    qcount++;
+    strncpy(j->line, line, LINE_LEN - 1); j->line[LINE_LEN - 1] = '\0';
+    j->client_fd = client_fd;
+    j->done_lock = &lk; j->done_cond = &cv; j->done_flag = &done;
+    pthread_cond_signal(&q_has_work);
+    pthread_mutex_unlock(&qlock);
+
+    pthread_mutex_lock(&lk);
+    while (!done) pthread_cond_wait(&cv, &lk);
+    pthread_mutex_unlock(&lk);
 }
 
-int main(void) {
-    char line[LINE_LEN];
-    out("CReaMSiQL\n");
-    out("  CREATE TABLE t (id INDEX, name, email INDEX)\n");
-    out("  INSERT INTO t VALUES ('1', 'Alice', 'alice@x.com')\n");
-    out("  SELECT * FROM t [WHERE col = val [AND col = val ...]]\n");
-    out("  SELECT COUNT FROM t [WHERE ...]\n");
-    out("  Ctrl-D to quit.\n\n");
-
+static void *writer_main(void *unused) {
+    (void)unused;
     while (1) {
-        out("creamsiql> ");
-        if (read_line(line, LINE_LEN) < 0) { out("\nbye\n"); break; }
-        if (!line[0]) continue;
+        pthread_mutex_lock(&qlock);
+        while (qcount == 0 && running) pthread_cond_wait(&q_has_work, &qlock);
+        if (qcount == 0 && !running) { pthread_mutex_unlock(&qlock); break; }
+
+        WriteJob *j = &wq[qhead];
+        qhead = (qhead + 1) % WRITE_QUEUE_CAP;
+
+        char line[LINE_LEN];
+        strncpy(line, j->line, LINE_LEN - 1); line[LINE_LEN - 1] = '\0';
+        int cfd = j->client_fd;
+        pthread_mutex_t *dl = j->done_lock;
+        pthread_cond_t  *dc = j->done_cond;
+        int             *df = j->done_flag;
+
+        qcount--;
+        pthread_cond_signal(&q_has_room);  /* slot is safe to reuse now */
+        pthread_mutex_unlock(&qlock);
+
+        out_fd = cfd;
         lex(line);
         switch (peek().type) {
             case TOK_CREATE: do_create(); break;
             case TOK_INSERT: do_insert(); break;
-            case TOK_SELECT: do_select(); break;
-            case TOK_EOF:    break;
-            default: oerr("unknown command (try CREATE, INSERT, SELECT)"); break;
+            default: oerr("internal: bad write job"); break;
         }
+
+        pthread_mutex_lock(dl);
+        *df = 1;
+        pthread_cond_signal(dc);
+        pthread_mutex_unlock(dl);
     }
+    return NULL;
+}
+
+/* ─── worker threads ────────────────────────────────────────────────
+ * All N workers block in accept() on the same listening socket; the
+ * kernel hands each incoming connection to exactly one of them. A
+ * worker owns its connection until the client closes it. SELECT runs
+ * right here with zero coordination; CREATE/INSERT are hand off to
+ * the writer thread above. */
+static int listen_fd = -1;
+
+static void *worker_main(void *unused) {
+    (void)unused;
+    char line[LINE_LEN];
+    while (running) {
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) { if (!running) break; continue; }
+        out_fd = cfd;
+        while (running) {
+            int n = fd_readline(cfd, line, LINE_LEN);
+            if (n < 0) break;          /* client closed or read error */
+            if (n == 0) continue;      /* blank line */
+            lex(line);
+            switch (peek().type) {
+                case TOK_CREATE:
+                case TOK_INSERT: submit_write_job(line, cfd); break;
+                case TOK_SELECT: do_select(); break;
+                case TOK_EOF:    break;
+                default: oerr("unknown command (try CREATE, INSERT, SELECT)"); break;
+            }
+        }
+        close(cfd);
+    }
+    return NULL;
+}
+
+static void on_shutdown_signal(int sig) {
+    (void)sig;
+    running = 0;
+    if (listen_fd >= 0) close(listen_fd); /* unblocks every accept() */
+}
+
+int main(int argc, char **argv) {
+    int port = DEFAULT_PORT;
+    long ncores = sysconf(_SC_NPROCESSORS_ONLN);
+    int nworkers = (ncores > 0 && ncores <= MAX_WORKERS) ? (int)ncores : 4;
+    if (argc > 1) port = atoi(argv[1]);
+    if (argc > 2) {
+        int w = atoi(argv[2]);
+        if (w > 0 && w <= MAX_WORKERS) nworkers = w;
+    }
+
+    signal(SIGPIPE, SIG_IGN);            /* a dead client socket must not kill the server */
+    signal(SIGINT, on_shutdown_signal);
+    signal(SIGTERM, on_shutdown_signal);
+
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { oerr("cannot create socket"); return 1; }
+    int yes = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons((uint16_t)port);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { oerr("cannot bind"); return 1; }
+    if (listen(listen_fd, 128) < 0) { oerr("cannot listen"); return 1; }
+
+    out("CReaMSiQL server\n");
+    out("  listening on port "); out_int(port); out("\n");
+    out("  workers: "); out_int(nworkers); out(" + 1 writer\n");
+    out("  CREATE TABLE t (id INDEX, name, email INDEX)\n");
+    out("  INSERT INTO t VALUES ('1', 'Alice', 'alice@x.com')\n");
+    out("  SELECT * FROM t [WHERE col = val [AND col = val ...]]\n");
+    out("  SELECT COUNT FROM t [WHERE ...]\n\n");
+
+    pthread_t writer_tid;
+    pthread_create(&writer_tid, NULL, writer_main, NULL);
+
+    pthread_t workers[MAX_WORKERS];
+    for (int i = 0; i < nworkers; i++)
+        pthread_create(&workers[i], NULL, worker_main, NULL);
+
+    for (int i = 0; i < nworkers; i++)
+        pthread_join(workers[i], NULL);
+
+    /* every worker has stopped accepting; wake the writer so it can
+     * drain whatever's left in the queue and exit cleanly */
+    pthread_mutex_lock(&qlock);
+    pthread_cond_broadcast(&q_has_work);
+    pthread_mutex_unlock(&qlock);
+    pthread_join(writer_tid, NULL);
+
     return 0;
 }

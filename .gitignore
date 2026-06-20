@@ -1,0 +1,5 @@
+creamsiql
+*.data
+*.idx
+*.schema
+test*.*
