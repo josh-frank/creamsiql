@@ -85,9 +85,9 @@
 
 /* ─── tuneable limits ───────────────────────────────────────────── */
 #define MAX_TOKENS 128
-#define MAX_COLS 8
+#define MAX_COLS 32
 #define MAX_CONDS 8
-#define MAX_VALS 8
+#define MAX_VALS 32
 #define COL_LEN 64
 #define VAL_LEN 256
 #define LINE_LEN 512
