@@ -61,6 +61,7 @@
  *     [8..15]  data_off  u64  — byte offset of row in .data
  *    [16..23]  chain     u64  — next overflow bucket index (0 = end)
  *
+ * Compile: cc creamsiql.c -o creamsiql
  * Run: ./creamsiql [port] [workers]   (defaults: 7878, one per core)
  * Talk to it with: nc 127.0.0.1 7878
  */
