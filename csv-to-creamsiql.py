@@ -15,18 +15,14 @@ Usage:
 """
 import argparse
 import csv
-import select
 import socket
 import sys
 
 
-def send(sock, line, quiet=0.25):
+def send(sock, line):
     sock.sendall((line + "\n").encode())
     buf = b""
-    while True:
-        r, _, _ = select.select([sock], [], [], quiet)
-        if not r:
-            break
+    while not buf.endswith(b"\n"):
         chunk = sock.recv(4096)
         if not chunk:
             break
