@@ -115,13 +115,83 @@ static _Thread_local Token tokens[MAX_TOKENS];
 static _Thread_local int   ntok = 0;
 static _Thread_local int   pos  = 0;
 
-/* which fd output goes to. Defaults to stdout (1) so the startup
- * banner on the main thread works unchanged; each worker sets this to
- * its client's socket fd for the lifetime of that connection. */
-static _Thread_local int out_fd = 1;
+/* ─── buffered I/O ───────────────────────────────────────────────────
+ * One ReadBuf + one WriteBuf per worker thread (and one WriteBuf for
+ * the writer thread), stack-local, reused across every connection /
+ * job that thread ever handles — never malloc'd, never per-connection.
+ * Replaces byte-at-a-time read() and per-field write() with chunked
+ * syscalls; same "no malloc anywhere" property as the rest of the file. */
+#define IOBUF_SZ 4096
+
+typedef struct {
+    int  fd;
+    char data[IOBUF_SZ];
+    int  start, end;   /* [start,end) is unread; end == -1 means EOF seen */
+} ReadBuf;
+
+typedef struct {
+    int  fd;
+    char data[IOBUF_SZ];
+    int  len;
+} WriteBuf;
+
+static void rb_reset(ReadBuf *rb, int fd) { rb->fd = fd; rb->start = 0; rb->end = 0; }
+
+static void rb_fill(ReadBuf *rb) {
+    if (rb->start < rb->end) return;   /* still unread bytes, nothing to do */
+    int n = (int)read(rb->fd, rb->data, IOBUF_SZ);
+    if (n <= 0) { rb->end = -1; return; }
+    rb->start = 0; rb->end = n;
+}
+
+/* same contract as the old fd_readline: strips trailing '\n', returns
+ * chars in the line (0 for blank), -1 at EOF with nothing left to give. */
+static int rb_readline(ReadBuf *rb, char *buf, int bufsz) {
+    int i = 0;
+    while (1) {
+        if (rb->start >= rb->end) {
+            rb_fill(rb);
+            if (rb->end == -1) { buf[i] = '\0'; return (i > 0) ? i : -1; }
+        }
+        while (rb->start < rb->end) {
+            char c = rb->data[rb->start++];
+            if (c == '\n') { buf[i] = '\0'; return i; }
+            if (i < bufsz - 1) buf[i++] = c;
+        }
+    }
+}
+
+static void wb_reset(WriteBuf *wb, int fd) { wb->fd = fd; wb->len = 0; }
+
+static void wb_flush(WriteBuf *wb) {
+    if (wb->len == 0) return;
+    write(wb->fd, wb->data, wb->len);
+    wb->len = 0;
+}
+
+static void wb_put(WriteBuf *wb, const char *s, int slen) {
+    int pos = 0;
+    while (pos < slen) {
+        int space = IOBUF_SZ - wb->len;
+        int chunk = (slen - pos < space) ? (slen - pos) : space;
+        memcpy(wb->data + wb->len, s + pos, chunk);
+        wb->len += chunk;
+        pos += chunk;
+        if (wb->len == IOBUF_SZ) wb_flush(wb);
+    }
+}
+
+/* each pool/writer thread points this at its own stack-local WriteBuf
+ * for the lifetime of the connection/job it's currently handling. NULL
+ * on the main thread, where out()/oerr() fall back to raw fd 1 so the
+ * startup banner still works unchanged. */
+static _Thread_local WriteBuf *out_wb = NULL;
 
 /* ─── output helpers ────────────────────────────────────────────── */
-static void out(const char *s) { write(out_fd, s, strlen(s)); }
+static void out(const char *s) {
+    if (out_wb) wb_put(out_wb, s, (int)strlen(s));
+    else        write(1, s, strlen(s));
+}
 static void oerr(const char *s) { out("error: "); out(s); out("\n"); }
 
 /* ─── integer to decimal string ─────────────────────────────────── */
@@ -696,6 +766,7 @@ static void submit_write_job(const char *line, int client_fd) {
 
 static void *writer_main(void *unused) {
     (void)unused;
+    WriteBuf wwb;   /* one per thread, reused across every job, reset per-job below */
     while (1) {
         pthread_mutex_lock(&qlock);
         while (qcount == 0 && running) pthread_cond_wait(&q_has_work, &qlock);
@@ -715,13 +786,15 @@ static void *writer_main(void *unused) {
         pthread_cond_signal(&q_has_room);  /* slot is safe to reuse now */
         pthread_mutex_unlock(&qlock);
 
-        out_fd = cfd;
+        wb_reset(&wwb, cfd);
+        out_wb = &wwb;
         lex(line);
         switch (peek().type) {
             case TOK_CREATE: do_create(); break;
             case TOK_INSERT: do_insert(); break;
             default: oerr("internal: bad write job"); break;
         }
+        wb_flush(&wwb);   /* one job, one fd — flush its reply before signaling done */
 
         pthread_mutex_lock(dl);
         *df = 1;
@@ -742,12 +815,16 @@ static int listen_fd = -1;
 static void *worker_main(void *unused) {
     (void)unused;
     char line[LINE_LEN];
+    ReadBuf  rb;   /* one per thread, reused across every connection */
+    WriteBuf wb;
     while (running) {
         int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) { if (!running) break; continue; }
-        out_fd = cfd;
+        rb_reset(&rb, cfd);
+        wb_reset(&wb, cfd);
+        out_wb = &wb;
         while (running) {
-            int n = fd_readline(cfd, line, LINE_LEN);
+            int n = rb_readline(&rb, line, LINE_LEN);
             if (n < 0) break;          /* client closed or read error */
             if (n == 0) continue;      /* blank line */
             lex(line);
@@ -758,7 +835,9 @@ static void *worker_main(void *unused) {
                 case TOK_EOF:    break;
                 default: oerr("unknown command (try CREATE, INSERT, SELECT)"); break;
             }
+            wb_flush(&wb);   /* one command, one reply — flush before reading the next line */
         }
+        wb_flush(&wb);       /* safety net for anything left buffered */
         close(cfd);
     }
     return NULL;
